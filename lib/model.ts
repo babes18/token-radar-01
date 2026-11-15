@@ -1,4 +1,4 @@
-// Token Radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds every
 // other rankable pre-token protocol below the watchlist floor: the early rows the radar exists to find.
@@ -6,17 +6,20 @@
 // the snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed
 // into the ranked board.
 //
-// Implied value follows only from the snapshot's own figures, and the multiple is calibrated from the
-// snapshot itself, never from a hardcoded list of names:
+// Implied value follows only from the snapshot's own figures, and both calibration signals are
+// calibrated from the snapshot itself, never from a hardcoded list of names:
 //
 //   multiple   = the median mcap / TVL of the snapshot's token-bearing protocols in the protocol's
 //                own category (at least 3 of them), else the median over every token-bearing
 //                protocol; clamped to [0.05, 1.50]
+//   momentum   = 1 + clamp(median 7-day TVL change of the category's token-bearing protocols,
+//                -30, 60) / 100 x 0.25; the category's traded peers' week, as a second signal
+//                beside the multiple. Same >= 3 rule, same global fallback.
 //   base       = tvl_usd x multiple
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x 0.5
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   implied    = max(1, round(base x growthMult x maturity x momentum))
 //
 // The same function scores every row, and the dashboard recomputes each row from the same figures, so
 // the page and board.json agree. A protocol's name is never special-cased.
@@ -56,6 +59,9 @@ export interface ModelConstants {
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  momentum_weight: number;
+  momentum_floor: number;
+  momentum_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -69,10 +75,13 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
+  momentum_weight: 0.25,
+  momentum_floor: -30,
+  momentum_cap: 60,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -106,22 +115,32 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    momentum_multiplier: number;
+    momentum_source: string;
     age_days: number | null;
   };
   farm_steps: string[];
 }
 
-/** One category's calibrated multiple, as the dashboard's Method tab shows it. */
+/** One category's calibrated multiple, as the dashboard's Method tab shows it. The two source strings
+ *  are the full wording board.json carries; the dashboard's compact tuple carries the counts instead
+ *  and the page derives the same wording from them. */
 export interface MultipleRow {
   category: string;
   n: number;
   median: number;
   multiple: number;
   source: string;
+  momentum: number;
+  momentum_n: number;
+  momentum_source: string;
 }
 
-/** A category's multiple as a compact array: [category, n, median, multiple, source]. */
-export type MultipleTuple = [string, number, number, number, string];
+/** A category's multiple as a compact array: [category, n, median, multiple, momentum, momentum_n].
+ *  The page derives the source wording from the two counts: n >= 3 names the median of n token-bearing
+ *  protocols, else the global median; momentum_n >= 3 names the 7d median of momentum_n, else the
+ *  global 7d median. */
+export type MultipleTuple = [string, number, number, number, number, number];
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
 export interface LiveRow {
@@ -134,8 +153,9 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** A live-token protocol as a compact array: [slug, name, category, chains, tvl_usd, mcap_usd, change_7d]. */
-export type LiveTuple = [string, string, string | null, string[], number, number | null, number | null];
+/** A live-token protocol as a compact array: [slug, name, category, chains, tvl_usd, mcap_usd, change_7d].
+ *  Chains are indices into the dataset's chains table, as in RadarRow. */
+export type LiveTuple = [string, string, string | null, number[], number, number | null, number | null];
 
 /** Everything the dashboard renders, from the snapshot. */
 export interface RadarData {
@@ -150,15 +170,20 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   global_multiple: number;
+  global_momentum: number;
   multiples: MultipleTuple[];
+  chains: string[];
   rows: RadarRow[];
   live: LiveTuple[];
 }
 
 /** The dashboard's compact view of one row, as an array: [rank, slug, name, category, chains, tvl_usd,
- *  change_7d, age_days, implied_value_usd, category_multiple, growth_multiplier, maturity_multiplier].
- *  Farm plans are generated in the page from the same row fields, so the page and board.json agree. */
-export type RadarRow = [number, string, string, string | null, string[], number, number | null, number | null, number, number, number, number];
+ *  change_7d, age_days, implied_value_usd]. Chains are indices into the dataset's chains table: the
+ *  names repeat across 178 rows, so the table holds each once. The three multipliers are NOT carried:
+ *  the page recomputes them from the same figures (the category's multiple and momentum from the
+ *  multiples table, growth and maturity from change_7d and age), so the page and board.json agree
+ *  without storing them twice. */
+export type RadarRow = [number, string, string, string | null, number[], number, number | null, number | null, number];
 
 /** Why the snapshot is not one this model can score. */
 export class SnapshotError extends Error {
@@ -191,51 +216,65 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The median mcap / TVL of the snapshot's token-bearing protocols, per category and overall.
+/** The two calibration signals, from one pass over the snapshot's token-bearing protocols.
  *  A category keeps its own median only with at least `model.multiple_min_n` protocols behind it;
- *  anything thinner falls back to the global median, and the multiple is clamped to the model's band. */
-export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; byCategory: Map<string, MultipleRow> } {
-  const byCat = new Map<string, number[]>();
-  const all: number[] = [];
+ *  anything thinner falls back to the global median, and each signal is rounded to 4 decimals BEFORE
+ *  it enters the product, so the board and the page's recompute agree to the dollar. */
+export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; globalMomentum: number; byCategory: Map<string, MultipleRow> } {
+  const ratiosByCat = new Map<string, number[]>();
+  const changesByCat = new Map<string, number[]>();
+  const allRatios: number[] = [];
+  const allChanges: number[] = [];
   for (const p of snapshot.protocols) {
     if (p.gecko_id === null && p.symbol === null) continue;
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const r = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(r) || r <= 0) continue;
-    all.push(r);
+    allRatios.push(r);
     const c = p.category ?? 'Other';
-    const list = byCat.get(c) ?? [];
-    list.push(r);
-    byCat.set(c, list);
+    const ratios = ratiosByCat.get(c) ?? [];
+    ratios.push(r);
+    ratiosByCat.set(c, ratios);
+    if (p.change_7d === null || !Number.isFinite(p.change_7d)) continue;
+    allChanges.push(p.change_7d);
+    const changes = changesByCat.get(c) ?? [];
+    changes.push(p.change_7d);
+    changesByCat.set(c, changes);
   }
-  all.sort((a, b) => a - b);
-  const globalMedian = medianOf(all) ?? 0.25;
+  allRatios.sort((a, b) => a - b);
+  allChanges.sort((a, b) => a - b);
+  const globalMedian = medianOf(allRatios) ?? 0.25;
   // The global median is rounded to the same 4 decimals the page displays and recomputes with: the
   // board's implied values and the page's recompute must agree to the dollar, not just to the eye.
   const global = round4(Math.min(model.multiple_max, Math.max(model.multiple_min, globalMedian)));
+  const globalMomentum = momentumOf(medianOf(allChanges) ?? 0, model);
   const byCategory = new Map<string, MultipleRow>();
-  for (const [c, list] of [...byCat.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+  for (const [c, list] of [...ratiosByCat.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     list.sort((a, b) => a - b);
     const med = medianOf(list) ?? globalMedian;
-    if (list.length >= model.multiple_min_n) {
-      byCategory.set(c, {
-        category: c,
-        n: list.length,
-        median: round4(med),
-        multiple: round4(Math.min(model.multiple_max, Math.max(model.multiple_min, med))),
-        source: `median of ${list.length} token-bearing ${c} protocols`,
-      });
-    } else {
-      byCategory.set(c, {
-        category: c,
-        n: list.length,
-        median: round4(med),
-        multiple: round4(global),
-        source: `only ${list.length} token-bearing ${c} protocol${list.length === 1 ? '' : 's'}: global median`,
-      });
-    }
+    const changes = changesByCat.get(c) ?? [];
+    changes.sort((a, b) => a - b);
+    const changeMed = medianOf(changes);
+    const ownMomentum = changeMed !== null && changes.length >= model.multiple_min_n;
+    byCategory.set(c, {
+      category: c,
+      n: list.length,
+      median: round4(med),
+      multiple: list.length >= model.multiple_min_n ? round4(Math.min(model.multiple_max, Math.max(model.multiple_min, med))) : round4(global),
+      source: list.length >= model.multiple_min_n ? `median of ${list.length} token-bearing protocols` : `only ${list.length}: global median`,
+      momentum: ownMomentum ? momentumOf(changeMed, model) : globalMomentum,
+      momentum_n: changes.length,
+      momentum_source: ownMomentum ? `7d median of ${changes.length}` : 'global 7d median',
+    });
   }
-  return { global, byCategory };
+  return { global, globalMomentum, byCategory };
+}
+
+/** The momentum multiplier for one median 7-day change: the category's traded peers' week, clamped
+ *  and weighted, rounded to 4 decimals before it enters the product. */
+export function momentumOf(medianChange7d: number, model: ModelConstants = MODEL): number {
+  const clamped = Math.min(model.momentum_cap, Math.max(model.momentum_floor, medianChange7d));
+  return round4(1 + (clamped / 100) * model.momentum_weight);
 }
 
 /** The multiple one protocol's category gets: its own category's, or the global median. */
@@ -245,23 +284,31 @@ export function multipleFor(category: string | null, multiples: { global: number
   return { multiple: multiples.global, source: 'no token-bearing protocol in this category: global median' };
 }
 
+/** The momentum one protocol's category gets: its own category's, or the global momentum. */
+export function momentumFor(category: string | null, multiples: { globalMomentum: number; byCategory: Map<string, MultipleRow> }): { momentum: number; source: string } {
+  const row = multiples.byCategory.get(category ?? 'Other');
+  if (row !== undefined) return { momentum: row.momentum, source: row.momentum_source };
+  return { momentum: multiples.globalMomentum, source: 'no token-bearing protocol in this category: global momentum' };
+}
+
 /** The multipliers and the implied value one protocol gets under the model. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  multiples: { global: number; byCategory: Map<string, MultipleRow> },
+  calibration: { global: number; globalMomentum: number; byCategory: Map<string, MultipleRow> },
   model: ModelConstants = MODEL,
-): { implied: number; multiple: number; multipleSource: string; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): { implied: number; multiple: number; multipleSource: string; growthPct: number; growthMult: number; maturityMult: number; momentumMult: number; momentumSource: string; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const { multiple, source } = multipleFor(protocol.category, multiples);
+  const { multiple, source } = multipleFor(protocol.category, calibration);
+  const { momentum, source: momentumSource } = momentumFor(protocol.category, calibration);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, multiple, multipleSource: source, growthPct, growthMult, maturityMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * momentum));
+  return { implied, multiple, multipleSource: source, growthPct, growthMult, maturityMult, momentumMult: momentum, momentumSource, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -296,7 +343,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const multiples = categoryMultiples(snapshot, model);
+  const calibration = calibrate(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -313,7 +360,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, multiples, model);
+    const v = impliedValue(p, snapshot.as_of, calibration, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -338,6 +385,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
+      momentum_multiplier: round4(s.momentumMult),
+      momentum_source: s.momentumSource,
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -491,29 +540,31 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** A board row's compact form for data.js: an array, in the order the page's comment names. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, chainIndex: Map<string, number>): RadarRow {
   return [
     row.rank,
     row.slug,
     row.name,
     row.category,
-    row.chains,
+    row.chains.map((c) => chainIndex.get(c) ?? -1),
     row.tvl_usd,
     row.change_7d,
     row.age_days,
     row.implied_value_usd,
-    row.model.category_multiple,
-    row.model.growth_multiplier,
-    row.model.maturity_multiplier,
   ];
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const multiples = categoryMultiples(snapshot, model);
+  const calibration = calibrate(snapshot, model);
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const chainSet = new Set<string>();
+  for (const r of board) for (const c of r.chains) chainSet.add(c);
+  for (const r of live) for (const c of r.chains) chainSet.add(c);
+  const chains = [...chainSet].sort();
+  const chainIndex = new Map(chains.map((c, i) => [c, i]));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: 'DefiLlama protocols endpoint, fetched 2026-11-14T01:18:33.201Z',
@@ -525,10 +576,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    global_multiple: round4(multiples.global),
-    multiples: [...multiples.byCategory.values()].map((m): MultipleTuple => [m.category, m.n, m.median, m.multiple, m.source]),
-    rows: board.map(radarRow),
-    live: live.map((r): LiveTuple => [r.slug, r.name, r.category, r.chains, r.tvl_usd, r.mcap_usd, r.change_7d]),
+    global_multiple: round4(calibration.global),
+    global_momentum: round4(calibration.globalMomentum),
+    multiples: [...calibration.byCategory.values()].map((m): MultipleTuple => [m.category, m.n, m.median, m.multiple, m.momentum, m.momentum_n]),
+    chains,
+    rows: board.map((r) => radarRow(r, chainIndex)),
+    live: live.map((r): LiveTuple => [r.slug, r.name, r.category, r.chains.map((c) => chainIndex.get(c) ?? -1), r.tvl_usd, r.mcap_usd, r.change_7d]),
   };
   return { board, radar };
 }
@@ -598,8 +651,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network.
  *  Rows are arrays in this order: [rank, slug, name, category, chains, tvl_usd, change_7d, age_days,
- *  implied_value_usd, category_multiple, growth_multiplier, maturity_multiplier]. Multiples are
- *  [category, n, median, multiple, source]; live rows are [slug, name, category, chains, tvl_usd,
+ *  implied_value_usd], with chains as indices into the chains table. Multiples are [category, n,
+ *  median, multiple, momentum, momentum_n]; live rows are [slug, name, category, chains, tvl_usd,
  *  mcap_usd, change_7d]. */
 export function dataScript(radar: RadarData): string {
   return `// Token Radar data: the ranked board as compact arrays (see the order in lib/model.ts),
