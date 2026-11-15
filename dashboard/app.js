@@ -24,35 +24,49 @@ const MATURITY_FLOOR = MODEL.maturity_floor ?? 0.6;
 const MATURITY_RANGE = MODEL.maturity_range ?? 0.4;
 const MATURITY_DAYS = MODEL.maturity_days ?? 1095;
 const UNKNOWN_AGE = MODEL.unknown_age_days ?? 365;
+const MOMENTUM_WEIGHT = MODEL.momentum_weight ?? 0.25;
+const MOMENTUM_FLOOR = MODEL.momentum_floor ?? -30;
+const MOMENTUM_CAP = MODEL.momentum_cap ?? 60;
 
 /** The watchlist's slugs, for the watchlist-only filter and the badges. */
 const WATCHLIST = new Set(DATA.watchlist || []);
+/** The chain names, once: rows and live rows carry indices into this table. */
+const CHAINS = DATA.chains || [];
 /** The multiples the program calibrated from the snapshot, by category. Compact arrays: [category, n,
- *  median, multiple, source]. */
-const MULTIPLES = new Map((DATA.multiples || []).map((m) => [m[0], { category: m[0], n: m[1], median: m[2], multiple: m[3], source: m[4] }]));
+ *  median, multiple, momentum, momentum_n]. The source wording is derived from the two counts, exactly
+ *  as the program words it: n >= 3 names the median of n token-bearing protocols, else the global
+ *  median; momentum_n >= 3 names the 7d median of momentum_n, else the global 7d median. */
+const MULTIPLES = new Map((DATA.multiples || []).map((m) => [m[0], {
+  category: m[0],
+  n: m[1],
+  median: m[2],
+  multiple: m[3],
+  source: m[1] >= (MODEL.multiple_min_n ?? 3) ? `median of ${m[1]} token-bearing protocols` : `only ${m[1]}: global median`,
+  momentum: m[4],
+  momentum_n: m[5],
+  momentum_source: m[5] >= (MODEL.multiple_min_n ?? 3) ? `7d median of ${m[5]}` : 'global 7d median',
+}]));
 
 /** A board row as named fields. Rows are arrays: [rank, slug, name, category, chains, tvl_usd, change_7d,
- *  age_days, implied_value_usd, category_multiple, growth_multiplier, maturity_multiplier]. */
+ *  age_days, implied_value_usd], with chains as indices into the chains table. The three multipliers
+ *  are recomputed below from the same figures, never stored twice. */
 function toRow(a) {
   return {
     rank: a[0],
     slug: a[1],
     name: a[2],
     category: a[3],
-    chains: a[4],
+    chains: a[4].map((i) => CHAINS[i] ?? ''),
     tvl_usd: a[5],
     change_7d: a[6],
     age_days: a[7],
     implied_value_usd: a[8],
-    category_multiple: a[9],
-    growth_multiplier: a[10],
-    maturity_multiplier: a[11],
   };
 }
 const ROWS = DATA.rows.map(toRow);
 const BY_SLUG = new Map(ROWS.map((r) => [r.slug, r]));
 /** The live-token reference set. Compact arrays: [slug, name, category, chains, tvl_usd, mcap_usd, change_7d]. */
-const LIVE = (DATA.live || []).map((a) => ({ slug: a[0], name: a[1], category: a[2], chains: a[3], tvl_usd: a[4], mcap_usd: a[5], change_7d: a[6] }));
+const LIVE = (DATA.live || []).map((a) => ({ slug: a[0], name: a[1], category: a[2], chains: a[3].map((i) => CHAINS[i] ?? ''), tvl_usd: a[4], mcap_usd: a[5], change_7d: a[6] }));
 const MAX_IMPLIED = ROWS.length > 0 ? ROWS[0].implied_value_usd : 1;
 
 const $ = (s) => document.querySelector(s);
@@ -88,6 +102,13 @@ function fmtAge(days) {
 function fmtMult(n) {
   return `${Math.round(n * 100) / 100}×`;
 }
+function ordinal(n) {
+  if (n % 100 >= 11 && n % 100 <= 13) return `${n}th`;
+  if (n % 10 === 1) return `${n}st`;
+  if (n % 10 === 2) return `${n}nd`;
+  if (n % 10 === 3) return `${n}rd`;
+  return `${n}th`;
+}
 
 /** The multiple one protocol's category gets: its own category's, or the global median. */
 function multipleFor(category) {
@@ -96,14 +117,63 @@ function multipleFor(category) {
   return { multiple: DATA.global_multiple, source: 'no token-bearing protocol in this category: global median' };
 }
 
+/** The momentum one protocol's category gets: its own category's, or the global momentum. */
+function momentumFor(category) {
+  const row = MULTIPLES.get(category ?? 'Other');
+  if (row) return { momentum: row.momentum, source: row.momentum_source };
+  return { momentum: DATA.global_momentum, source: 'no token-bearing protocol in this category: global momentum' };
+}
+
+/** Four decimals, as the program rounds each calibrated signal before it enters the product. */
+function round4(n) {
+  return Math.round(n * 1e4) / 1e4;
+}
+
+/** The row's growth multiplier, from its own 7-day change, full precision for the recompute. */
+function growthMultOf(row) {
+  const growth = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, row.change_7d ?? 0));
+  return 1 + (growth / 100) * GROWTH_WEIGHT;
+}
+
+/** The row's maturity multiplier, from its age, full precision for the recompute. */
+function maturityMultOf(row) {
+  const age = row.age_days ?? UNKNOWN_AGE;
+  return MATURITY_FLOOR + (Math.min(Math.max(age, 0), MATURITY_DAYS) / MATURITY_DAYS) * MATURITY_RANGE;
+}
+
 /** The row's implied value, recomputed on the page from the same figures board.json carries. */
 function impliedOf(row) {
-  const growth = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, row.change_7d ?? 0));
-  const growthMult = 1 + (growth / 100) * GROWTH_WEIGHT;
-  const age = row.age_days ?? UNKNOWN_AGE;
-  const maturityMult = MATURITY_FLOOR + (Math.min(Math.max(age, 0), MATURITY_DAYS) / MATURITY_DAYS) * MATURITY_RANGE;
+  const growthMult = growthMultOf(row);
+  const maturityMult = maturityMultOf(row);
   const { multiple } = multipleFor(row.category);
-  return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturityMult));
+  const { momentum } = momentumFor(row.category);
+  return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturityMult * momentum));
+}
+
+/** Why this row ranks where it does, in words from its own figures: the size of its TVL against the
+ *  board, its category's multiple against the global median, its own 7-day change, its age, and its
+ *  category's momentum. Every clause is a reading of a number the row carries, never a slogan. */
+function reasonFor(row) {
+  const tvlRank = ROWS.filter((r) => r.tvl_usd > row.tvl_usd).length + 1;
+  const { multiple, source } = multipleFor(row.category);
+  const { momentum } = momentumFor(row.category);
+  const parts = [];
+  parts.push(`#${row.rank} on ${fmtUsd(row.tvl_usd)} of TVL — the ${tvlRank === 1 ? 'largest' : `${ordinal(tvlRank)}-largest`} on the board`);
+  if (source.includes('global median')) parts.push(`its ${escapeHtml(row.category || 'uncategorised')} category is too thin to price on its own, so it takes the global median multiple of ${fmtMult(DATA.global_multiple ?? 0.21)}`);
+  else if (multiple > (DATA.global_multiple ?? 0.21)) parts.push(`its category prices at ${fmtMult(multiple)}, above the global median of ${fmtMult(DATA.global_multiple ?? 0.21)}`);
+  else if (multiple < (DATA.global_multiple ?? 0.21)) parts.push(`its category prices at ${fmtMult(multiple)}, below the global median of ${fmtMult(DATA.global_multiple ?? 0.21)}`);
+  else parts.push(`its category prices at the global median of ${fmtMult(DATA.global_multiple ?? 0.21)}`);
+  if (row.change_7d === null || row.change_7d === undefined) parts.push('with no 7-day change reported, so growth counts as flat');
+  else if (row.change_7d > 0) parts.push(`with TVL up ${Math.round(row.change_7d * 10) / 10}% in 7 days, which lifts it`);
+  else if (row.change_7d < 0) parts.push(`with TVL down ${Math.round(-row.change_7d * 10) / 10}% in 7 days, which trims it`);
+  else parts.push('with TVL flat over 7 days');
+  if (row.age_days === null || row.age_days === undefined) parts.push('and no listing date, so it is counted as a year old');
+  else if (row.age_days < 180) parts.push(`and only ${fmtAge(row.age_days)} old, so maturity still discounts it`);
+  else parts.push(`and ${fmtAge(row.age_days)} old, so maturity barely discounts it`);
+  if (momentum > 1.005) parts.push(`its category's traded peers are up this week, a ${fmtMult(momentum)} lift`);
+  else if (momentum < 0.995) parts.push(`its category's traded peers are down this week, a ${fmtMult(momentum)} drag`);
+  else parts.push('its category\'s traded peers are flat this week, momentum 1×');
+  return `Why #${row.rank}: ${parts.join('; ')}.`;
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -230,6 +300,7 @@ function sortedRows(rows) {
   const val = (r) => {
     if (key === 'name') return r.name.toLowerCase();
     if (key === 'category') return (r.category || '').toLowerCase();
+    if (key === 'category_multiple') return multipleFor(r.category).multiple;
     return r[key];
   };
   return [...rows].sort((a, b) => {
@@ -266,7 +337,7 @@ function boardHtml() {
       <td class="num">${fmtUsd(r.tvl_usd)}</td>
       <td class="num ${pctCls}">${pct}</td>
       <td class="num">${fmtAge(r.age_days)}</td>
-      <td class="num">${fmtMult(r.category_multiple)}</td>
+      <td class="num">${fmtMult(multipleFor(r.category).multiple)}</td>
       <td class="num implied">${fmtUsd(r.implied_value_usd)}<div class="implied-bar"><i style="width:${bar}%"></i></div></td>
     </tr>`;
   }).join('');
@@ -296,27 +367,58 @@ function liveHtml() {
 function methodHtml() {
   const multRows = [...MULTIPLES.values()].sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
   const body = multRows.map((m) => `<tr>
-    <td>${escapeHtml(m.category)}</td><td class="num">${m.n}</td><td class="num">${fmtMult(m.median)}</td><td class="num">${fmtMult(m.multiple)}</td><td>${escapeHtml(m.source)}</td>
+    <td>${escapeHtml(m.category)}</td><td class="num">${m.n}</td><td class="num">${fmtMult(m.median)}</td><td class="num">${fmtMult(m.multiple)}</td><td class="num">${fmtMult(m.momentum)} <small>(${escapeHtml(m.momentum_source)})</small></td><td>${escapeHtml(m.source)}</td>
   </tr>`).join('');
   return `<section class="method" aria-label="Method">
     <h2>How the ranking is made</h2>
-    <p>Every row is scored by the same formula, from the snapshot's own figures. The multiple is calibrated from the snapshot itself: the median mcap / TVL of the token-bearing protocols in the row's own category. No protocol's name is special-cased, and no figure comes from outside the snapshot.</p>
-    <p><code>implied = TVL × multiple × growth × maturity</code></p>
-    <h3>The multiple</h3>
-    <p>A category keeps its own median only with at least ${MODEL.multiple_min_n ?? 3} token-bearing protocols behind it; anything thinner falls back to the global median of ${fmtMult(DATA.global_multiple ?? 0.21)}. The multiple is clamped to ${fmtMult(MULT_MIN)}–${fmtMult(MULT_MAX)}.</p>
+    <p>Every row is scored by the same formula, from the snapshot's own figures. The multiple and the momentum are calibrated from the snapshot itself: the median mcap / TVL and the median 7-day change of the token-bearing protocols in the row's own category. No protocol's name is special-cased, and no figure comes from outside the snapshot.</p>
+    <p><code>implied = TVL × multiple × growth × maturity × momentum</code></p>
+    <h3>The multiple and the momentum</h3>
+    <p>A category keeps its own medians only with at least ${MODEL.multiple_min_n ?? 3} token-bearing protocols behind it; anything thinner falls back to the global median of ${fmtMult(DATA.global_multiple ?? 0.21)} and the global momentum of ${fmtMult(DATA.global_momentum ?? 0.98)}. The multiple is clamped to ${fmtMult(MULT_MIN)}–${fmtMult(MULT_MAX)}.</p>
     <div class="tablewrap"><table>
-      <thead><tr><th>Category</th><th class="num">Protocols</th><th class="num">Median mcap / TVL</th><th class="num">Multiple used</th><th>Source</th></tr></thead>
+      <thead><tr><th>Category</th><th class="num">Protocols</th><th class="num">Median mcap / TVL</th><th class="num">Multiple used</th><th class="num">Momentum</th><th>Source</th></tr></thead>
       <tbody>${body}</tbody>
     </table></div>
-    <h3>The other two terms</h3>
+    <h3>TVL against implied value</h3>
+    <p>Each dot is one board row: amber for the watchlist, teal for the early rows. The dashed line is implied = TVL × the global median multiple — where the multiple alone sets the value. Rows off the line are moved by their own growth, their age, or their category's momentum.</p>
+    ${scatterSvg()}
+    <h3>The other three terms</h3>
     <ul class="rules">
       <li><b>Growth:</b> the 7-day change, clamped to ${GROWTH_FLOOR}%–${GROWTH_CAP}%, times a weight of ${GROWTH_WEIGHT}: <code>1 + growth / 100 × ${GROWTH_WEIGHT}</code>. A protocol down 60% still keeps half its multiple; one up 120% gains at most 60%.</li>
       <li><b>Maturity:</b> <code>${MATURITY_FLOOR} + min(age, ${MATURITY_DAYS} days) / ${MATURITY_DAYS} × ${MATURITY_RANGE}</code>. A protocol listed for three years scores 1.00; a new listing scores 0.60. A protocol with no listing date is given ${UNKNOWN_AGE} days.</li>
+      <li><b>Momentum:</b> the median 7-day TVL change of the category's token-bearing protocols, clamped to ${MOMENTUM_FLOOR}%–${MOMENTUM_CAP}%, times a weight of ${MOMENTUM_WEIGHT}: <code>1 + median7d / 100 × ${MOMENTUM_WEIGHT}</code>. A category whose traded protocols are down 30% or more scores 0.93×; one up 60% scores 1.15×.</li>
       <li><b>What counts as pre-token:</b> no market cap, no CoinGecko id and no symbol in the snapshot. The board keeps out wrapped, staked and bridged products of a token that trades, and names ending in a version marker — they are pools of another protocol, not a launch.</li>
       <li><b>Coverage:</b> the board holds all ${DATA.watchlist_size} watchlist slugs, plus ${DATA.early_size} early rows below the watchlist floor. The page recomputes each row's implied value from the same figures; the detail view shows the check.</li>
     </ul>
     <p class="note">Implied value is a ranking device, not a price. It says what a protocol would be worth if it launched a token at its category's median ratio — it is not a promise that it will launch one, or at that value.</p>
   </section>`;
+}
+
+/** A log-log scatter of TVL against implied value, drawn as inline SVG from the board rows: no
+ *  image, no network, and the same data the table above states. */
+function scatterSvg() {
+  const W = 720, H = 360, L = 58, R = 14, T = 12, B = 36;
+  const xs = ROWS.map((r) => Math.log10(Math.max(1, r.tvl_usd)));
+  const ys = ROWS.map((r) => Math.log10(Math.max(1, r.implied_value_usd)));
+  const x0 = Math.floor(Math.min(...xs)), x1 = Math.ceil(Math.max(...xs));
+  const y0 = Math.floor(Math.min(...ys)), y1 = Math.ceil(Math.max(...ys));
+  const X = (v) => L + ((v - x0) / (x1 - x0)) * (W - L - R);
+  const Y = (v) => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  const label = (e) => (e >= 9 ? `$${Math.round(10 ** (e - 9))}B` : e >= 6 ? `$${Math.round(10 ** (e - 6))}M` : `$${Math.round(10 ** e / 1e3)}K`);
+  let grid = '';
+  for (let e = x0; e <= x1; e++) grid += `<line x1="${X(e).toFixed(1)}" y1="${T}" x2="${X(e).toFixed(1)}" y2="${H - B}" stroke="#2a3648"/><text x="${X(e).toFixed(1)}" y="${H - B + 16}" fill="#8b98a9" font-size="10" text-anchor="middle">${label(e)}</text>`;
+  for (let e = y0; e <= y1; e++) grid += `<line x1="${L}" y1="${Y(e).toFixed(1)}" x2="${W - R}" y2="${Y(e).toFixed(1)}" stroke="#2a3648"/><text x="${L - 6}" y="${(Y(e) + 3).toFixed(1)}" fill="#8b98a9" font-size="10" text-anchor="end">${label(e)}</text>`;
+  const g = Math.log10(DATA.global_multiple || 0.21);
+  let ax = x0, ay = x0 + g, bx = x1, by = x1 + g;
+  if (ay < y0) { ax = y0 - g; ay = y0; }
+  if (ay > y1) { ax = y1 - g; ay = y1; }
+  if (by < y0) { bx = y0 - g; by = y0; }
+  if (by > y1) { bx = y1 - g; by = y1; }
+  const ref = ax < bx ? `<line x1="${X(ax).toFixed(1)}" y1="${Y(ay).toFixed(1)}" x2="${X(bx).toFixed(1)}" y2="${Y(by).toFixed(1)}" stroke="#f0b429" stroke-dasharray="5 4"/>` : '';
+  const dots = ROWS.map((r, i) => `<circle cx="${X(xs[i]).toFixed(1)}" cy="${Y(ys[i]).toFixed(1)}" r="3" fill="${WATCHLIST.has(r.slug) ? '#f0b429' : '#2dd4bf'}" opacity="0.85"/>`).join('');
+  return `<svg class="scatter" viewBox="0 0 ${W} ${H}" role="img" aria-label="Scatter chart of TVL against implied value, log scales">
+    ${grid}${ref}${dots}
+  </svg>`;
 }
 
 function render() {
@@ -330,7 +432,7 @@ function render() {
       <li>Board <b>${ROWS.length} rows</b></li>
       <li>Watchlist <b>${DATA.watchlist_size}</b></li>
       <li>Early <b class="early">${DATA.early_size}</b></li>
-      <li>Model <b>${escapeHtml(DATA.model_version || 'radar-2')}</b></li>
+      <li>Model <b>${escapeHtml(DATA.model_version || 'radar-3')}</b></li>
       <li>Top implied <b>${fmtUsd(MAX_IMPLIED)}</b></li>
     </ul>
     <div class="tabs" role="tablist" aria-label="Views">${tabBtn('board', 'Board')}${tabBtn('live', 'Live tokens')}${tabBtn('method', 'Method')}</div>
@@ -390,14 +492,16 @@ function openDetail(slug, fromHash) {
     <div class="dlg-head"><h2>${escapeHtml(row.name)}</h2><button class="close" data-close>Close</button></div>
     <div class="dlg-body">
       <p style="margin:4px 0 0;color:var(--muted)">${escapeHtml(row.category || 'No category')} · ${row.chains.map((c) => escapeHtml(c)).join(', ') || 'no chain listed'} · rank #${row.rank}${WATCHLIST.has(row.slug) ? ' · watchlist' : ' · early'}</p>
+      <p class="why">${escapeHtml(reasonFor(row))}</p>
       <dl class="kv">
         <div><dt>Implied value</dt><dd>${fmtUsd(row.implied_value_usd)}<small>${matches ? 'The page recomputes this from the same figures — it matches board.json.' : `The page recomputes ${fmtUsd(recomputed)} — it does not match board.json.`}</small></dd></div>
         <div><dt>TVL</dt><dd>${fmtUsd(row.tvl_usd)}</dd></div>
         <div><dt>7-day change</dt><dd class="${pctClass(row.change_7d)}">${fmtPct(row.change_7d)}</dd></div>
         <div><dt>Age</dt><dd>${fmtAge(row.age_days)}<small>${row.age_days === null ? 'no listing date in the snapshot' : 'since first listed'}</small></dd></div>
         <div><dt>Category multiple</dt><dd>${fmtMult(multiple)}<small>${escapeHtml(source)}</small></dd></div>
-        <div><dt>Growth multiplier</dt><dd>${fmtMult(row.growth_multiplier)}<small>7d ${fmtPct(growth)} clamped to ${GROWTH_FLOOR}%–${GROWTH_CAP}%</small></dd></div>
-        <div><dt>Maturity multiplier</dt><dd>${fmtMult(row.maturity_multiplier)}<small>${MATURITY_FLOOR} + age / ${MATURITY_DAYS}d × ${MATURITY_RANGE}</small></dd></div>
+        <div><dt>Growth multiplier</dt><dd>${fmtMult(growthMultOf(row))}<small>7d ${fmtPct(growth)} clamped to ${GROWTH_FLOOR}%–${GROWTH_CAP}%</small></dd></div>
+        <div><dt>Maturity multiplier</dt><dd>${fmtMult(maturityMultOf(row))}<small>${MATURITY_FLOOR} + age / ${MATURITY_DAYS}d × ${MATURITY_RANGE}</small></dd></div>
+        <div><dt>Momentum multiplier</dt><dd>${fmtMult(momentumFor(row.category).momentum)}<small>its category's traded peers, 7d median: ${escapeHtml(momentumFor(row.category).source)}</small></dd></div>
       </dl>
       <h3>How to farm it</h3>
       <ol class="steps">${steps.map((s) => {

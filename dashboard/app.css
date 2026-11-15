@@ -105,6 +105,8 @@ dialog ol.steps { padding-left: 20px; margin: 0; }
 dialog ol.steps li { margin-bottom: 8px; }
 dialog ol.steps li small { display: block; color: var(--muted); font-size: 12.5px; }
 dialog .warn { background: #2b2209; border: 1px solid #6b5200; border-radius: 8px; padding: 10px 12px; font-size: 13px; color: var(--ink); margin-top: 14px; }
+dialog .why { background: var(--surface-2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; color: var(--ink); margin: 12px 0 0; }
+.method .scatter { display: block; width: 100%; max-width: 720px; height: auto; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); margin: 4px 0 8px; }
 footer { margin-top: 22px; color: var(--faint); font-size: 12.5px; }
 @media (max-width: 720px) {
   h1 { font-size: 22px; }
