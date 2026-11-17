@@ -1,15 +1,9 @@
-// Token Radar's page: no network, no framework. It reads window.RADAR (dashboard/data.js) and
-// renders the ranked board, a per-protocol detail view with the model's own inputs and a farm plan,
-// a launching-soon watchlist of bonding-curve tokens near graduation, a live-token reference view,
-// and a Method tab that states the model and shows the multiples it calibrated. The page recomputes
-// each row's implied value from the same figures board.json carries, so the page and the board agree.
-//
-// Hash state (so a view can be linked): #q=search, #category=, #chain=, #watchlist=1, #tab=board|
-// launching|live|method, #sort=, #dir=asc|desc, #p=<slug> opens the detail view.
+// Token Radar page: no network, no framework. Reads window.RADAR (dashboard/data.js),
+// renders the board, detail view, launching-soon watchlist, live tokens and Method tab.
+// Hash state: #q=, #category=, #chain=, #watchlist=1, #tab=board|launching|live|method,
+// #sort=, #dir=asc|desc, #p=<slug> opens the detail view.
 
 'use strict';
-
-/* global window, document, URLSearchParams */
 
 const DATA = window.RADAR;
 if (!DATA || !Array.isArray(DATA.rows)) throw new Error('token radar: no board data');
@@ -30,16 +24,12 @@ const RISK_YOUNG_DAYS = MODEL.risk_young_days ?? 90;
 const RISK_VOL_MID = MODEL.risk_vol_mid ?? 15;
 const RISK_VOL_HIGH = MODEL.risk_vol_high ?? 30;
 
-/** The watchlist's slugs, for the watchlist-only filter and the badges. */
 const WATCHLIST = new Set(DATA.watchlist || []);
-/** The chain names, once: rows and live rows carry indices into this table. */
+
 const CHAINS = DATA.chains || [];
-/** The category names, once: rows, live rows and multiples carry indices into this table. */
+
 const CATEGORIES = DATA.categories || [];
-/** The multiples the program calibrated from the snapshot, by category. Compact arrays: [category,
- *  n, median, multiple, momentum, momentum_n], with category an index into CATEGORIES. The source
- *  wording is derived from the two counts: n >= 3 names the median of n token-bearing protocols,
- *  else the global median; momentum_n >= 3 names the 7d median of momentum_n, else the global one. */
+
 const MULTIPLES = new Map((DATA.multiples || []).map((m) => [CATEGORIES[m[0]] ?? 'Other', {
   category: CATEGORIES[m[0]] ?? 'Other',
   n: m[1],
@@ -51,9 +41,6 @@ const MULTIPLES = new Map((DATA.multiples || []).map((m) => [CATEGORIES[m[0]] ??
   momentum_source: m[5] >= (MODEL.multiple_min_n ?? 3) ? `7d median of ${m[5]}` : 'global 7d median',
 }]));
 
-/** A board row as named fields. Rows are arrays: [rank, slug, name, category, chains, tvl_usd, change_7d,
- *  age_days, implied_value_usd], with category and chains as indices into the categories and chains
- *  tables. The three multipliers are recomputed below from the same figures, never stored twice. */
 function toRow(a) {
   return {
     rank: a[0],
@@ -69,10 +56,9 @@ function toRow(a) {
 }
 const ROWS = DATA.rows.map(toRow);
 const BY_SLUG = new Map(ROWS.map((r) => [r.slug, r]));
-/** The live-token reference set. Compact arrays: [slug, name, category, chains, tvl_usd, mcap_usd, change_7d], with category and chains as indices. */
+
 const LIVE = (DATA.live || []).map((a) => ({ slug: a[0], name: a[1], category: a[2] >= 0 ? (CATEGORIES[a[2]] ?? null) : null, chains: a[3].map((i) => CHAINS[i] ?? ''), tvl_usd: a[4], mcap_usd: a[5], change_7d: a[6] }));
-/** The Launching-soon watchlist: pump.fun bonding-curve tokens closest to graduation, frozen at
- *  build time. [name, symbol, mcap, vol24, buys24, sells24, holders, created_ms]. */
+
 const GRAD = (DATA.graduating || []).map((a) => ({ name: a[0], symbol: a[1], mcap: a[2], vol24: a[3], buys24: a[4], sells24: a[5], holders: a[6], created: a[7] }));
 const GRAD_MCAP = DATA.graduation_mcap_usd || 30000;
 const MAX_IMPLIED = ROWS.length > 0 ? ROWS[0].implied_value_usd : 1;
@@ -118,40 +104,32 @@ function ordinal(n) {
   return `${n}th`;
 }
 
-/** The multiple one protocol's category gets: its own category's, or the global median. */
 function multipleFor(category) {
   const row = MULTIPLES.get(category ?? 'Other');
   if (row) return { multiple: row.multiple, source: row.source };
   return { multiple: DATA.global_multiple, source: 'no token-bearing protocol in this category: global median' };
 }
 
-/** The momentum one protocol's category gets: its own category's, or the global momentum. */
 function momentumFor(category) {
   const row = MULTIPLES.get(category ?? 'Other');
   if (row) return { momentum: row.momentum, source: row.momentum_source };
   return { momentum: DATA.global_momentum, source: 'no token-bearing protocol in this category: global momentum' };
 }
 
-/** Four decimals, as the program rounds each calibrated signal before it enters the product. */
 function round4(n) {
   return Math.round(n * 1e4) / 1e4;
 }
 
-/** The row's growth multiplier, from its own 7-day change, full precision for the recompute. */
 function growthMultOf(row) {
   const growth = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, row.change_7d ?? 0));
   return 1 + (growth / 100) * GROWTH_WEIGHT;
 }
 
-/** The row's maturity multiplier, from its age, full precision for the recompute. */
 function maturityMultOf(row) {
   const age = row.age_days ?? UNKNOWN_AGE;
   return MATURITY_FLOOR + (Math.min(Math.max(age, 0), MATURITY_DAYS) / MATURITY_DAYS) * MATURITY_RANGE;
 }
 
-/** The row's risk multiplier, recomputed on the page from the same three figures the program
- *  uses: age, 7-day TVL swing and chain count. Young, volatile or single-chain rows are worth
- *  less than the same TVL in an old, steady, multi-chain protocol. */
 function riskOf(row) {
   let discount = 0;
   const flags = [];
@@ -170,7 +148,6 @@ function riskOf(row) {
   return { multiplier: round4(1 - discount), discount: round4(discount), flags };
 }
 
-/** The row's implied value, recomputed on the page from the same figures board.json carries. */
 function impliedOf(row) {
   const growthMult = growthMultOf(row);
   const maturityMult = maturityMultOf(row);
@@ -180,9 +157,6 @@ function impliedOf(row) {
   return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturityMult * momentum * riskMult));
 }
 
-/** Why this row ranks where it does, in words from its own figures: the size of its TVL against the
- *  board, its category's multiple against the global median, its own 7-day change, its age, and its
- *  category's momentum. Every clause is a reading of a number the row carries, never a slogan. */
 function reasonFor(row) {
   const tvlRank = ROWS.filter((r) => r.tvl_usd > row.tvl_usd).length + 1;
   const { multiple, source } = multipleFor(row.category);
@@ -209,7 +183,6 @@ function reasonFor(row) {
   return `Why #${row.rank}: ${parts.join('; ')}.`;
 }
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
 function capitalFor(row) {
   if (row.tvl_usd >= 5e9) return 250;
   if (row.tvl_usd >= 1e9) return 150;
@@ -266,7 +239,7 @@ function weeklyFor(row) {
   if (c.includes('insurance')) return 'Review the cover terms each week and renew before the policy lapses.';
   return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
 }
-/** A protocol's farm plan, from its own record: the same six steps the program writes to board.json. */
+
 function farmSteps(row) {
   const chain = row.chains.length > 0 ? row.chains[0] : 'its main chain';
   const capital = capitalFor(row);
@@ -288,7 +261,6 @@ function farmSteps(row) {
   });
 }
 
-/** The page's state, read from and written back to the hash. */
 function readState() {
   const p = new URLSearchParams(window.location.hash.slice(1));
   return {
@@ -400,10 +372,6 @@ function liveHtml() {
   </table></div>`;
 }
 
-/** Bonding-curve tokens on pump.fun, closest to graduation first. The curve completes when ~85 SOL
- *  has entered it — about ${fmtUsd(GRAD_MCAP)} of market cap at SOL $72 — so the bar is an estimate:
- *  the trigger is SOL, not dollars. Ages are as of the fetch date, not today: this tab is a frozen
- *  fetch, dated in its first line. */
 function launchingHtml() {
   const asOfMs = Date.parse(`${DATA.extras_as_of || '2026-11-17'}T00:00:00Z`);
   const rows = [...GRAD].sort((a, b) => b.mcap - a.mcap);
@@ -460,8 +428,6 @@ function methodHtml() {
   </section>`;
 }
 
-/** A log-log scatter of TVL against implied value, drawn as inline SVG from the board rows: no
- *  image, no network, and the same data the table above states. */
 function scatterSvg() {
   const W = 720, H = 360, L = 58, R = 14, T = 12, B = 36;
   const xs = ROWS.map((r) => Math.log10(Math.max(1, r.tvl_usd)));
