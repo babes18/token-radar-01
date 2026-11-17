@@ -83,7 +83,20 @@ for (const name of shots) {
 }
 
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
-writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
+const dossierPath = join(out, 'dossier.json');
+writeFileSync(dossierPath, buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
+
+// Fail loudly instead of shipping a truncated dossier: the judge reads at most TEXT_MAX_BYTES of
+// dashboard source, and buildDossier cuts a file that does not fit rather than refusing. The check
+// measures the raw dashboard bytes (the text the dossier must carry whole) and the cut marker, so a
+// build over the cap is fixed in the model, not discovered at submission.
+const dashDir = join(out, 'dashboard');
+const dashBytes = readdirSync(dashDir).reduce((n, f) => n + statSync(join(dashDir, f)).size, 0);
+const dossierText = JSON.parse(readFileSync(dossierPath, 'utf8')).text as string;
+if (dashBytes > TEXT_MAX_BYTES - 512 || dossierText.includes('[Cut at')) {
+  process.stderr.write(`token radar: dashboard source is ${dashBytes} bytes, past the ${TEXT_MAX_BYTES} cap the dossier can carry whole: trim the dashboard before submitting\n`);
+  process.exit(1);
+}
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
