@@ -50,6 +50,11 @@ export interface Snapshot {
   floor_usd: number;
   protocols: SnapshotProtocol[];
   watchlist: string[];
+  /** Records skipped at parse: no slug, no name, or no finite TVL — records the model cannot
+   *  score, since the implied value starts from TVL and the board names every row. The count is
+   *  reported on stdout, never silent; a skipped watchlist slug still fails the board's coverage
+   *  gate, which is the honest refusal for a board that cannot cover its watchlist. */
+  skipped_unscoreable: number;
 }
 
 /** The model's constants, as the dashboard states them. */
@@ -102,9 +107,12 @@ export const MODEL_VERSION = 'radar-4';
 export const LIVE_ROWS = 12;
 
 /** The board's early rows below the watchlist floor: the dossier's 65,536-byte text cap is the
- *  binding limit, and each early row costs ~88 bytes of dashboard data. 101 early rows keep the
- *  board at 141 rows while leaving room for the Launching-soon tab's data. The watchlist is never cut. */
-export const MAX_EARLY_ROWS = 101;
+ *  binding limit, and each early row costs ~88 bytes of dashboard data. 71 early rows keep the
+ *  board at 111 rows while leaving real headroom under the cap: v3's 101 early rows put the
+ *  dashboard 234 bytes under the gate on the kit snapshot and the server's larger snapshot
+ *  pushed it over, so the program exited instead of shipping a truncated dossier. The
+ *  watchlist is never cut. */
+export const MAX_EARLY_ROWS = 71;
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -708,13 +716,19 @@ export function parseSnapshot(text: string): Snapshot {
   if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
   if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
   if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
+  // One odd record must never kill the whole run: a protocol with no slug, no name or no finite
+  // TVL cannot be scored at all, so it is skipped and counted (see the Snapshot interface).
+  // Everything else already normalizes — a missing category becomes null, a missing or
+  // non-finite change becomes null, chains default to [] — so no field access in the scoring
+  // path can throw on a parsed record. A malformed document (no as_of, no floor, no protocols
+  // array, no watchlist of slugs) still throws: that is the whole input, not one record.
+  let skippedUnscoreable = 0;
+  const protocols: SnapshotProtocol[] = [];
+  for (const v of o.protocols) {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) { skippedUnscoreable++; continue; }
     const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
-    }
-    return {
+    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) { skippedUnscoreable++; continue; }
+    protocols.push({
       slug: p.slug,
       name: p.name,
       category: typeof p.category === 'string' ? p.category : null,
@@ -725,13 +739,14 @@ export function parseSnapshot(text: string): Snapshot {
       listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
       gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
-    };
-  });
+    });
+  }
   return {
     as_of: o.as_of,
     source: o.source,
     floor_usd: o.floor_usd,
     protocols,
+    skipped_unscoreable: skippedUnscoreable,
     watchlist: o.watchlist as string[],
   };
 }
