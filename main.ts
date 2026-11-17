@@ -100,5 +100,6 @@ if (dashBytes > TEXT_MAX_BYTES - 512 || dossierText.includes('[Cut at')) {
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    (snapshot.skipped_unscoreable > 0 ? `token radar: skipped ${snapshot.skipped_unscoreable} protocol record(s) with no slug, name or finite TVL — records the model cannot score\n` : '') +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')} (${dashFiles.length + 1} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
